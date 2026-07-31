@@ -1,0 +1,14 @@
+langchain_community
+langchain
+langgraph
+langchain-google-genai
+langchain-huggingface
+langchain-chroma
+langchain-text-splitters
+sentence-transformers
+transformers
+pypdf
+requests
+composio
+composio-langchain
+python-dotenv
