@@ -80,12 +80,26 @@ Update the values:
 GEMINI_API_KEY=your_gemini_api_key
 COMPOSIO_API_KEY=your_composio_api_key
 COMPOSIO_USER_ID=your_composio_user_id
+HF_TOKEN=your_huggingface_token
 
 EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2
 GEMINI_MODEL=gemini-3.1-flash-lite
 
 DOCUMENT_PATH=./data/research_paper.pdf
 ```
+
+`HF_TOKEN` is required for gated/private HuggingFace models, and recommended even for public ones to avoid Hub rate limits. Get it from https://huggingface.co/settings/tokens. `HuggingFaceEmbeddings` picks it up automatically from the environment — no code change needed.
+
+### Where to Get Each Key
+
+| Key | Get it from |
+|---|---|
+| `GEMINI_API_KEY` | https://aistudio.google.com/apikey — Google AI Studio, free tier available |
+| `COMPOSIO_API_KEY` | https://app.composio.dev — Dashboard → Settings → API Keys |
+| `COMPOSIO_USER_ID` | Composio dashboard → your account/user id, or generate one via Composio SDK on first auth |
+| `HF_TOKEN` | https://huggingface.co/settings/tokens — create a token with "Read" scope |
+
+Tavily access must also be connected inside your Composio account (Composio dashboard → Toolkits → Tavily → Connect) — this app loads Tavily tools through Composio, not a direct Tavily API key.
 
 ## Running
 

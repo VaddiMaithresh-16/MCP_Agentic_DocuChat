@@ -9,8 +9,8 @@ __pycache__/
 *.pyc
 *.pyo
 venv/
-avenv/
 .venv/
+avenv/
 *.egg-info/
 
 # OS

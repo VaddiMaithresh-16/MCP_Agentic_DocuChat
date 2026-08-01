@@ -37,6 +37,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY")
 COMPOSIO_USER_ID = os.getenv("COMPOSIO_USER_ID")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
+HF_TOKEN = os.getenv("HF_TOKEN")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL")
 DOCUMENT_PATH = os.getenv("DOCUMENT_PATH")
 
@@ -51,6 +52,9 @@ if not COMPOSIO_USER_ID:
 
 if not EMBEDDING_MODEL:
     raise ValueError("Missing EMBEDDING_MODEL")
+
+if not HF_TOKEN:
+    raise ValueError("Missing HF_TOKEN")
 
 if not DOCUMENT_PATH:
     raise ValueError("Missing DOCUMENT_PATH")
@@ -91,7 +95,10 @@ print(f"Number of Chunks: {len(all_splits)}")
 """## Step 3: Initialize the Embedding Model"""
 
 embedding_model = HuggingFaceEmbeddings(
-    model_name=EMBEDDING_MODEL
+    model_name=EMBEDDING_MODEL,
+    model_kwargs={
+        "token": HF_TOKEN
+    }
 )
 
 """## Step 4: Create the Chroma Vector Database"""
