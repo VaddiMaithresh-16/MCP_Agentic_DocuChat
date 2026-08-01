@@ -43,6 +43,13 @@ Notes:
 
 ## Setup
 
+Clone the repo:
+
+```bash
+git clone https://github.com/VaddiMaithresh-16/MCP_Agentic_DocuChat.git
+cd Agentic-DocuChat
+```
+
 Create and activate a virtual environment.
 
 macOS or Linux:
