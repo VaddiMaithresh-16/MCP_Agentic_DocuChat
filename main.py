@@ -1,9 +1,18 @@
 """## Import Required Libraries"""
 
 import os
+import requests
 from dotenv import load_dotenv
 load_dotenv()
-from pprint import pprint
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    module="langchain_community"
+)
+
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -30,7 +39,6 @@ COMPOSIO_USER_ID = os.getenv("COMPOSIO_USER_ID")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL")
 DOCUMENT_PATH = os.getenv("DOCUMENT_PATH")
-USER_QUERY = os.getenv("USER_QUERY")
 
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY")
@@ -47,16 +55,24 @@ if not EMBEDDING_MODEL:
 if not DOCUMENT_PATH:
     raise ValueError("Missing DOCUMENT_PATH")
 
-if not USER_QUERY:
-    raise ValueError("Missing USER_QUERY")
-
 """# Part I – Indexing
 
 ## Step 1: Load & Explore the Document
 """
 
 loader = PyPDFLoader(DOCUMENT_PATH)
-documents = loader.load()
+
+try:
+    documents = loader.load()
+except FileNotFoundError:
+    raise SystemExit(f"DOCUMENT_PATH not found: {DOCUMENT_PATH}")
+except requests.exceptions.RequestException as e:
+    raise SystemExit(f"Could not fetch DOCUMENT_PATH URL: {DOCUMENT_PATH}\nReason: {e}")
+except Exception as e:
+    raise SystemExit(f"Failed to load/parse PDF from DOCUMENT_PATH: {DOCUMENT_PATH}\nReason: {e}")
+
+if not documents:
+    raise SystemExit(f"PDF loaded but contains no pages: {DOCUMENT_PATH}")
 
 print(f"Total Pages: {len(documents)}")
 
@@ -85,7 +101,11 @@ vector_store = Chroma(
     embedding_function=embedding_model,
     persist_directory="./chroma_langchain_db"
 )
-document_ids = vector_store.add_documents(all_splits)
+existing = vector_store.get(limit=1)
+if existing["ids"]:
+    print("Existing embeddings found, skipping re-ingestion.")
+else:
+    document_ids = vector_store.add_documents(all_splits)
 
 """### Verify Stored Embeddings"""
 
@@ -252,22 +272,30 @@ def get_final_answer(response):
 ## Test 1: Question only from PDF
 """
 
-parser = argparse.ArgumentParser(description="Agentic RAG DocuChat")
-parser.add_argument(
-    "--query",
-    default=USER_QUERY,
-    help="Override USER_QUERY from .env"
-)
-
-args = parser.parse_args()
 async def main():
-    
-    response = await docu_chat(args.query)
+
+    parser = argparse.ArgumentParser(description="Agentic RAG DocuChat")
+    parser.add_argument(
+        "--query",
+        default=None,
+        help="Question to ask. If not given, you'll be prompted interactively."
+    )
+    args = parser.parse_args()
+
+    query = args.query
+    if not query:
+        query = input("Enter your question: ").strip()
+
+    if not query:
+        print("No question entered. Exiting.")
+        return
+
+    response = await docu_chat(query)
 
     if response is None:
         return
 
-    print(f"\nUser Query:\n{args.query}\n")
+    print(f"\nUser Query:\n{query}\n")
 
     print("\nAssistant Response:\n")
     print(get_final_answer(response))

@@ -1,46 +1,26 @@
-# Environment
+# Secrets
 .env
-.env.*
-!.env.example
+
+# Vector store (runtime generated)
+chroma_langchain_db/
 
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-*.pyd
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-build/
-dist/
-*.egg-info/
-
-# Virtual Environment
-.venv/
 venv/
 avenv/
+.venv/
+*.egg-info/
 
-# Chroma DB
-chroma_langchain_db/
-
-# Composio local cache
-.composio_cache/
-
-# Local documents / generated data
-data/
-*.pdf
-
-# Logs
-*.log
+# OS
+.DS_Store
+Thumbs.db
 
 # IDE
 .vscode/
 .idea/
 
-# macOS
-.DS_Store
-
-# Jupyter
-.ipynb_checkpoints/
+# Data (keep folder, ignore contents if you don't want the PDF in repo)
+# data/*
+# !data/.gitkeep
