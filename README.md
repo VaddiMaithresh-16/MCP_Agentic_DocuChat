@@ -47,7 +47,7 @@ Clone the repo:
 
 ```bash
 git clone https://github.com/VaddiMaithresh-16/MCP_Agentic_DocuChat.git
-cd Agentic-DocuChat
+cd MCP_Agentic_DocuChat
 ```
 
 Create and activate a virtual environment.
