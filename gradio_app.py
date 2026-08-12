@@ -63,11 +63,13 @@ def _status_text(refresh: bool = False) -> str:
         status = backend.status(refresh=refresh)
         ollama = status["ollama"]
         llamacpp = status["llamacpp"]
+        mcp_running = status["mcp_tools"] != "off"
         lines = [
             f"Document: {status['document']} ({status['pages']} pages)",
             f"Embeddings: {status['embedding_model']}",
             f"{STATUS_DOT[llamacpp['running']]} llama.cpp \u2014 {'running' if llamacpp['running'] else 'offline'}",
             f"{STATUS_DOT[ollama['running']]} Ollama \u2014 {'running' if ollama['running'] else 'offline'}",
+            f"{STATUS_DOT[mcp_running]} MCP tools \u2014 {status['mcp_tools']}",
         ]
         return "\n".join(lines)
     except Exception as error:
