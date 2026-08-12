@@ -3,6 +3,8 @@
 
 # Vector store (runtime generated)
 chroma_langchain_db/
+agentic_rag_memory.sqlite3
+agentic_rag_memory.sqlite3-*
 
 # Python
 __pycache__/
@@ -12,6 +14,9 @@ venv/
 .venv/
 avenv/
 *.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # OS
 .DS_Store
@@ -22,5 +27,6 @@ Thumbs.db
 .idea/
 
 # Data (keep folder, ignore contents if you don't want the PDF in repo)
+data/uploads/
 # data/*
 # !data/.gitkeep
