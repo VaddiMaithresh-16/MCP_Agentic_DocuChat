@@ -141,6 +141,7 @@ class RagBackend:
         self._embedding_models: dict[str, Any] = {}
         self._models: dict[str, Any] = {}
         self._agents: dict[str, Any] = {}
+        self._tools_cache: list[Any] | None = None
         self._ollama_status_cache: dict[str, Any] | None = None
         self._ollama_status_time: float = 0.0
         self._llamacpp_status_cache: dict[str, Any] | None = None
@@ -315,9 +316,9 @@ class RagBackend:
         return retrieve_from_pdf
 
     def _web_tools(self) -> list[Any]:
-        """Pull in Composio (MCP) tools for the Gemini agent. Toolkits are
-        configurable via COMPOSIO_TOOLKITS (comma-separated) so more than
-        web search can be wired in without touching code — e.g.
+        """Fetch Composio (MCP) tools. Toolkits are configurable via
+        COMPOSIO_TOOLKITS (comma-separated) so more than web search can be
+        wired in without touching code — e.g.
         `COMPOSIO_TOOLKITS=TAVILY,GOOGLECALENDAR,GMAIL`."""
         if not (self.composio_api_key and self.composio_user_id and self.composio_toolkits):
             return []
@@ -332,6 +333,25 @@ class RagBackend:
         except Exception as error:
             logger.warning("Composio tools disabled (%s): %s", ", ".join(self.composio_toolkits), error)
             return []
+
+    def _get_tools(self) -> list[Any]:
+        """Composio client construction + a tools.get() network call is
+        wasteful to repeat per agent — fetch once and share across every
+        provider's agent (Gemini, and local providers when MCP is on)."""
+        if self._tools_cache is None:
+            self._tools_cache = self._web_tools()
+        return self._tools_cache
+
+    def _use_agent(self, provider: str) -> bool:
+        """Gemini always gets the tool-calling agent (retrieval tool for
+        adaptive re-querying, plus MCP tools if configured). Local
+        providers (llama.cpp, Ollama) only go through the agent when MCP
+        tools are actually configured — otherwise the faster, streaming,
+        direct-grounded path is used, since small local models don't need
+        agent overhead just to answer from pre-fetched context."""
+        if provider == "gemini":
+            return True
+        return provider in LOCAL_PROVIDERS and bool(self._get_tools())
 
     # ------------------------------------------------------------ providers
 
@@ -436,14 +456,15 @@ class RagBackend:
             return self._models[key], self.llamacpp_model
         raise RuntimeError("Provider must be Gemini, Ollama, or llama.cpp.")
 
-    def _get_agent(self):
-        """Gemini uses a tool-calling agent (retrieval + optional web search).
-        Ollama intentionally does not — direct grounded generation is more
-        reliable for small local models (see README)."""
-        key = f"agent:gemini:{self.gemini_model}"
+    def _get_agent(self, provider: str = "gemini"):
+        """Tool-calling agent (retrieval + MCP tools) for any provider.
+        Gemini always uses this; local providers use it only when MCP
+        tools are configured (see `_use_agent`)."""
+        provider = provider.lower()
+        key = f"agent:{provider}"
         if key not in self._agents:
-            model, _ = self._get_model("gemini")
-            tools = self._web_tools() + [self._retrieval_tool()]
+            model, _ = self._get_model(provider)
+            tools = self._get_tools() + [self._retrieval_tool()]
             self._agents[key] = create_agent(
                 model=model,
                 tools=tools,
@@ -514,7 +535,21 @@ class RagBackend:
 
         max_attempts = max(1, int(os.getenv("ANSWER_LOOP_MAX_ATTEMPTS", "2")))
 
-        if provider in LOCAL_PROVIDERS:
+        if self._use_agent(provider):
+            agent = self._get_agent(provider)
+            response = await agent.ainvoke(
+                {"messages": [{"role": "user", "content": context_package}]},
+                config={"configurable": {"thread_id": user_id}},
+            )
+            answer = self._answer_text(response)
+            # Loop engineering for agent-based providers too: a single
+            # grounding check + repair pass, using the raw model directly
+            # rather than re-running the whole tool-calling agent.
+            if max_attempts > 1 and needs_grounding_repair(answer, context_text):
+                model, _ = self._get_model(provider)
+                repair_response = await _invoke_with_retry(model, repair_prompt(context_package, answer))
+                answer = self._answer_text({"messages": [repair_response]})
+        else:
             model, _ = self._get_model(provider)
             answer = ""
             for attempt in range(1, max_attempts + 1):
@@ -524,20 +559,6 @@ class RagBackend:
                     break
                 response = await _invoke_with_retry(model, repair_prompt(context_package, answer))
                 answer = self._answer_text({"messages": [response]})
-        else:
-            agent = self._get_agent()
-            response = await agent.ainvoke(
-                {"messages": [{"role": "user", "content": context_package}]},
-                config={"configurable": {"thread_id": user_id}},
-            )
-            answer = self._answer_text(response)
-            # Loop engineering for Gemini too (previously Ollama-only): a
-            # single grounding check + repair pass, using the raw model
-            # directly rather than re-running the whole tool-calling agent.
-            if max_attempts > 1 and needs_grounding_repair(answer, context_text):
-                model, _ = self._get_model("gemini")
-                repair_response = await _invoke_with_retry(model, repair_prompt(context_package, answer))
-                answer = self._answer_text({"messages": [repair_response]})
 
         result = {
             "answer": answer,
@@ -555,9 +576,11 @@ class RagBackend:
 
     async def astream_answer(self, question: str, user_id: str = "default", provider: str = "llamacpp"):
         """Yield answer text incrementally for local providers (llama.cpp,
-        Ollama) so the UI can show tokens as they're generated instead of
-        waiting for the full response. Falls back to a single chunk for
-        Gemini, whose tool-calling agent doesn't stream cleanly here.
+        Ollama) when no MCP tools are needed, so the UI can show tokens as
+        they're generated instead of waiting for the full response. Falls
+        back to a single chunk when the tool-calling agent is in play
+        (Gemini always; local providers when MCP tools are configured),
+        since agents don't stream cleanly through this path.
 
         Cache and memory bookkeeping mirror `ask()` — this is a streaming
         twin of it, not a separate code path for retrieval or storage.
@@ -571,6 +594,13 @@ class RagBackend:
         self._check_rate_limit(user_id)
         if provider not in {"gemini", "ollama", "llamacpp"}:
             raise RuntimeError("Choose Gemini, Ollama, or llama.cpp.")
+
+        if self._use_agent(provider):
+            # Non-streaming fallback — reuse the normal ask() path. Checked
+            # before retrieval runs here, so it isn't run twice.
+            result = await self._ask_impl(question, user_id, provider)
+            yield result["answer"], result["sources"]
+            return
 
         if provider == "gemini":
             model_name = self.gemini_model
@@ -590,12 +620,6 @@ class RagBackend:
         context_text, sources, _docs = self._retrieve(question)
         recent_text = self.memory.recent_turns_text(user_id)
         context_package = build_context_package(question, memories_text, recent_text, context_text)
-
-        if provider not in LOCAL_PROVIDERS:
-            # Non-streaming fallback — reuse the normal ask() path.
-            result = await self._ask_impl(question, user_id, provider)
-            yield result["answer"], result["sources"]
-            return
 
         model, _ = self._get_model(provider)
         answer = ""
@@ -678,10 +702,15 @@ class RagBackend:
             if self.embedding_provider == "online"
             else f"{self.embedding_model_name} (local)"
         )
+        tools = self._get_tools()
+        mcp_label = (
+            f"{len(tools)} tool(s) from {', '.join(self.composio_toolkits)}" if tools else "off"
+        )
         return {
             "document": Path(self.document_path).name,
             "pages": len(self.documents),
             "embedding_model": embedding_label,
+            "mcp_tools": mcp_label,
             "ollama": self._cached_ollama_status(force=refresh),
             "llamacpp": self._cached_llamacpp_status(force=refresh),
         }

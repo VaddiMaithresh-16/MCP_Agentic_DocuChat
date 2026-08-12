@@ -11,7 +11,7 @@ Agentic RAG DocuChat lets you ask questions about PDF documents using retrieval-
 - Choose between llama.cpp (local, default), Gemini, and Ollama for each question
 - llama.cpp default model: `Qwen3-4B-GGUF:Q4_0`, served locally by `llama-server`
 - Ollama default model: `gemma3:4b`
-- Both llama.cpp and Ollama use direct grounded generation instead of tool-calling, which is more reliable for small local models, and stream answers token by token
+- Both llama.cpp and Ollama use direct grounded generation by default (faster, streams token by token); they automatically switch to the same MCP tool-calling agent Gemini uses when Composio tools are configured
 - Switchable embeddings: local (HuggingFace, private, default) or online (Google API) — toggle in the UI or via `EMBEDDING_PROVIDER`, rebuilds the index automatically
 - Automatic Ollama/llama.cpp readiness status
 - Stable Chroma IDs, MMR retrieval, and index rebuilds are skipped when nothing changed
@@ -33,7 +33,7 @@ Agentic RAG DocuChat lets you ask questions about PDF documents using retrieval-
 ## Project layout
 
 ```text
-MCP_Agentic_DocuChat/
+MCP_Agentic_DocuChat-main/
 ├── main.py                  # Original CLI application
 ├── rag_backend.py           # Provider-aware RAG backend
 ├── persistent_memory.py     # SQLite memory, cache, and feedback
@@ -111,7 +111,9 @@ COMPOSIO_USER_ID=your_composio_user_id
 COMPOSIO_TOOLKITS=TAVILY
 ```
 
-The Gemini agent (only Gemini — llama.cpp/Ollama use direct grounded generation, not tool-calling) can call any Composio-connected toolkit. `COMPOSIO_TOOLKITS` is comma-separated, so you can add more than web search — e.g. `COMPOSIO_TOOLKITS=TAVILY,GOOGLECALENDAR,GMAIL` — without touching code, as long as those toolkits are connected on your Composio account. If Composio isn't configured, Gemini just answers from the document with no tools.
+The Gemini agent always has retrieval + any configured Composio tools. **llama.cpp and Ollama get MCP tools too**: as soon as `COMPOSIO_TOOLKITS` resolves to at least one tool, local providers automatically route through the same tool-calling agent instead of the direct-grounded fast path — no separate flag to flip. Streaming is only available on the direct-grounded path, so a local answer becomes a single non-streaming response once MCP tools are active (the same trade-off Gemini already has). `COMPOSIO_TOOLKITS` is comma-separated, so you can add more than web search — e.g. `COMPOSIO_TOOLKITS=TAVILY,GOOGLECALENDAR,GMAIL` — without touching code, as long as those toolkits are connected on your Composio account. If Composio isn't configured, every provider just answers from the document with no tools, and local providers keep streaming.
+
+The sidebar status panel shows an MCP tools line (on/off + tool count) so it's obvious which mode you're in.
 
 ### Gemini
 
@@ -252,15 +254,16 @@ Sources, feedback, and memory update
 ### Engineering guardrails
 
 - **Context engineering:** every provider receives labelled task, memory, conversation, and retrieved-document sections with size limits, built from the same `build_context_package`. Gemini previously got no pre-fetched document context at all (it relied entirely on the agent choosing to call the retrieval tool) — it now gets the same retrieved passages Ollama does, while keeping the tool available for adaptive re-querying.
-- **Prompt engineering:** Gemini uses a tool-aware system prompt; Ollama uses a grounded local prompt that treats PDF text as evidence rather than instructions.
-- **Loop engineering:** both providers check whether the answer looks grounded (empty/too short, or missing a page citation when evidence existed) and run a repair pass if not, via the shared `needs_grounding_repair` check. Previously this only ran for Ollama. The limit is controlled by `ANSWER_LOOP_MAX_ATTEMPTS`.
+- **Prompt engineering:** agent-based providers (Gemini always; llama.cpp/Ollama when MCP tools are configured) use a tool-aware system prompt; the direct-grounded path uses a grounded local prompt that treats PDF text as evidence rather than instructions.
+- **Loop engineering:** every provider checks whether the answer looks grounded (empty/too short, or missing a page citation when evidence existed) and runs a repair pass if not, via the shared `needs_grounding_repair` check. The limit is controlled by `ANSWER_LOOP_MAX_ATTEMPTS`.
+- **MCP tool access is provider-agnostic:** `_use_agent(provider)` decides per-question whether a provider needs the tool-calling agent — Gemini always does, local providers do only when `_get_tools()` returns at least one Composio tool. Composio's client + `tools.get()` call is fetched once and cached (`_get_tools`) and shared across every provider's agent, instead of being rebuilt per agent.
 
 ### Performance
 
 - **Retrieval runs once per question**, not twice. The MMR search results are reused for both the generation context and the "Sources used" panel.
-- **Embedding, chat, and agent objects are built once per config and cached** (`_get_embeddings`, `_get_model`, `_get_agent`) — uploading or rebuilding a document no longer reloads the embedding model into memory, and switching providers doesn't reconstruct a client that's already warm.
+- **Embedding, chat, agent, and MCP-tool objects are built once per config and cached** (`_get_embeddings`, `_get_model`, `_get_agent`, `_get_tools`) — uploading or rebuilding a document no longer reloads the embedding model into memory, switching providers doesn't reconstruct a client that's already warm, and Composio isn't re-queried per question or per agent.
 - **Ollama's health/GPU probe is cached** (`OLLAMA_STATUS_CACHE_SECONDS`, default 15s) instead of spawning `nvidia-smi` and hitting the Ollama HTTP API on every single message. The Gradio "Refresh system status" button always forces a fresh probe.
-- **The Gradio UI uses native async handlers and `demo.queue()`** instead of calling `asyncio.run()` per click. Local providers (llama.cpp, Ollama) stream tokens live via `astream_answer` instead of waiting for the full response; Gemini shows a progressive "Thinking…" state since its tool-calling agent doesn't stream cleanly through this path.
+- **The Gradio UI uses native async handlers and `demo.queue()`** instead of calling `asyncio.run()` per click, and offloads blocking calls (PDF upload, index rebuild, embedding-provider switch) to a thread via `asyncio.to_thread` so they don't freeze the UI. Local providers stream tokens live via `astream_answer` when the direct-grounded path is used; any provider running through the tool-calling agent (Gemini, or a local provider with MCP tools on) shows a progressive "Thinking…" state instead, since agents don't stream cleanly through this path.
 - **Local-provider calls retry with exponential backoff** (`_invoke_with_retry`, 2 retries by default) — a server that's still warming up or a dropped connection doesn't immediately surface as an error.
 - **The response cache is bounded**, not unbounded SQLite growth: entries expire after `CACHE_TTL_SECONDS` (default 7 days) and the table is pruned to `CACHE_MAX_ENTRIES` (default 2000, oldest first) on every write.
 - **llama.cpp auto-detects the loaded model** from `llama-server`'s `/v1/models` response, so `LLAMACPP_MODEL` doesn't have to exactly match what the server reports (e.g. a local `.gguf` path vs an HF repo id).
