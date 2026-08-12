@@ -12,3 +12,6 @@ langchain-text-splitters==1.1.2
 requests==2.34.2
 composio==0.18.1
 composio-langchain==0.18.1
+gradio>=5.0,<6.0
+langchain-ollama>=0.3.0,<1.0
+langchain-openai>=0.3.0,<1.0
