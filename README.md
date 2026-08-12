@@ -33,7 +33,7 @@ Agentic RAG DocuChat lets you ask questions about PDF documents using retrieval-
 ## Project layout
 
 ```text
-MCP_Agentic_DocuChat-main/
+MCP_Agentic_DocuChat/
 ├── main.py                  # Original CLI application
 ├── rag_backend.py           # Provider-aware RAG backend
 ├── persistent_memory.py     # SQLite memory, cache, and feedback
@@ -70,6 +70,7 @@ On Windows PowerShell:
 ```powershell
 python -m venv avenv
 avenv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
