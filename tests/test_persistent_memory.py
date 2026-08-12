@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 
 from persistent_memory import PersistentMemory, ResponseCache
@@ -24,6 +25,29 @@ class PersistentMemoryTests(unittest.TestCase):
 
             self.assertIsNotNone(captured)
             self.assertIn("concise answers", memory.memories("user-1")[0])
+
+    def test_cache_entries_expire_after_ttl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = PersistentMemory(f"{directory}/memory.sqlite3")
+            cache = ResponseCache(memory, ttl_seconds=0)
+            cache.put("key", {"answer": "stale soon"})
+            time.sleep(0.01)
+            self.assertIsNone(cache.get("key"))
+
+    def test_cache_is_pruned_to_max_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = PersistentMemory(f"{directory}/memory.sqlite3")
+            cache = ResponseCache(memory, max_entries=3)
+            for index in range(6):
+                cache.put(f"key-{index}", {"answer": f"answer-{index}"})
+                time.sleep(0.001)  # ensure distinct created_at ordering
+
+            with memory._connect() as connection:
+                remaining = connection.execute("SELECT COUNT(*) AS n FROM response_cache").fetchone()["n"]
+            self.assertEqual(remaining, 3)
+            # the most recent entries should be the ones that survived
+            self.assertIsNotNone(cache.get("key-5"))
+            self.assertIsNone(cache.get("key-0"))
 
 
 if __name__ == "__main__":

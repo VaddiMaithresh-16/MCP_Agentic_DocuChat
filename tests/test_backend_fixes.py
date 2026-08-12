@@ -67,6 +67,33 @@ class GroundingRepairTests(unittest.TestCase):
     def test_no_retrieved_context_never_needs_repair(self):
         self.assertFalse(needs_grounding_repair("Short.", "No relevant passages were found in the PDF."))
 
+    def test_inline_page_citation_format_is_recognized(self):
+        # Regression test: prompts now ask for inline citations formatted
+        # like "(paper.pdf, p. 4)" rather than the word "page" — the
+        # grounding check must recognize that format too, not just "page N".
+        self.assertFalse(
+            needs_grounding_repair(
+                "Self-attention is used across positions (paper.pdf, p. 2).",
+                "Source: paper.pdf, page 2\nSome real evidence.",
+            )
+        )
+
+
+class PromptEngineeringCitationFormatTests(unittest.TestCase):
+    """Regression test: every prompt that asks a model to cite evidence
+    must ask for the same inline citation format, so answers from every
+    provider are consistent and `needs_grounding_repair` can recognize them."""
+
+    def test_all_prompts_request_the_inline_citation_format(self):
+        from prompt_engineering import agent_system_prompt, ollama_prompt, repair_prompt
+
+        for text in (
+            agent_system_prompt(),
+            ollama_prompt("<task>context</task>"),
+            repair_prompt("<task>context</task>", "draft answer"),
+        ):
+            self.assertIn("p. N", text)
+
 
 if __name__ == "__main__":
     unittest.main()

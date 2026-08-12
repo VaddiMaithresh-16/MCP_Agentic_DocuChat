@@ -24,7 +24,7 @@ backend: RagBackend | None = None
 startup_error = ""
 
 PROVIDERS = ["Llama.cpp", "Gemini", "Ollama"]
-EMBEDDING_CHOICES = ["Local", "Online"]
+EMBEDDING_CHOICES = ["Local", "Online", "Llama.cpp"]
 STATUS_DOT = {True: "\U0001F7E2", False: "\U0001F534"}
 
 COPY_JS = """
@@ -65,7 +65,8 @@ def _status_text(refresh: bool = False) -> str:
         llamacpp = status["llamacpp"]
         mcp_running = status["mcp_tools"] != "off"
         lines = [
-            f"Document: {status['document']} ({status['pages']} pages)",
+            f"Documents ({status['document_count']}): {status['document']}",
+            f"Pages: {status['pages']}",
             f"Embeddings: {status['embedding_model']}",
             f"{STATUS_DOT[llamacpp['running']]} llama.cpp \u2014 {'running' if llamacpp['running'] else 'offline'}",
             f"{STATUS_DOT[ollama['running']]} Ollama \u2014 {'running' if ollama['running'] else 'offline'}",
@@ -80,9 +81,28 @@ def _refresh_status() -> str:
     return _status_text(refresh=True)
 
 
+def _document_choices() -> list[str]:
+    if backend is None:
+        return []
+    return [Path(path).name for path in backend.list_documents()]
+
+
+def _path_for_name(name: str) -> str | None:
+    if backend is None:
+        return None
+    for path in backend.list_documents():
+        if Path(path).name == name:
+            return path
+    return None
+
+
 # ----------------------------------------------------------------- chat ---
 
 async def answer_question(question: str, user_id: str, provider: str, history: list[dict] | None):
+    """Streams for every provider. Direct-grounded local providers stream
+    real tokens; agent-based providers (Gemini always, local when MCP tools
+    are on) stream the agent's own text tokens when possible and otherwise
+    show one non-streaming update — `astream_answer` handles that choice."""
     history = history or []
 
     if backend is None:
@@ -109,37 +129,20 @@ async def answer_question(question: str, user_id: str, provider: str, history: l
     )
 
     provider_key = provider.lower().replace(".", "").replace(" ", "")
-
-    if provider_key in {"ollama", "llamacpp"} and backend is not None:
-        try:
-            sources_text = ""
-            updated = history
-            async for partial_answer, sources in backend.astream_answer(question, user_id, provider_key):
-                sources_list = "\n".join(f"- {source}" for source in sources)
-                sources_text = f"**Sources**\n{sources_list}" if sources_list else "No document sources returned."
-                updated = history + [
-                    {"role": "user", "content": question},
-                    {"role": "assistant", "content": partial_answer or "\u2026"},
-                ]
-                yield updated, sources_text, f"Streaming from {provider}\u2026", "", partial_answer
-            yield updated, sources_text, f"{provider} \u00b7 done", "", updated[-1]["content"]
-        except Exception as error:
-            message = f"I couldn't answer with {provider}.\n\n**Reason:** {error}"
-            updated = history + [{"role": "user", "content": question}, {"role": "assistant", "content": message}]
-            yield updated, "", f"Provider error: {error}", "", ""
-        return
-
     try:
-        result = await backend.ask(question, user_id, provider_key)
-        sources = "\n".join(f"- {source}" for source in result.get("sources", []))
-        source_text = f"**Sources**\n{sources}" if sources else "No document sources returned."
-        cache_text = "cached" if result.get("cached") else "fresh"
-        status = f"{provider} \u00b7 {result.get('model', '')} \u00b7 {cache_text} answer"
-        updated = history + [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": result["answer"]},
-        ]
-        yield updated, source_text, status, "", result["answer"]
+        sources_text = ""
+        updated = history
+        last_answer = ""
+        async for partial_answer, sources in backend.astream_answer(question, user_id, provider_key):
+            sources_list = "\n".join(f"- {source}" for source in sources)
+            sources_text = f"**Sources**\n{sources_list}" if sources_list else "No document sources returned."
+            last_answer = partial_answer
+            updated = history + [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": partial_answer or "\u2026"},
+            ]
+            yield updated, sources_text, f"{provider} \u00b7 answering\u2026", "", last_answer
+        yield updated, sources_text, f"{provider} \u00b7 done", "", last_answer
     except Exception as error:
         message = f"I couldn't answer with {provider}.\n\n**Reason:** {error}"
         updated = history + [{"role": "user", "content": question}, {"role": "assistant", "content": message}]
@@ -161,25 +164,56 @@ def export_chat(history: list[dict] | None) -> str | None:
 
 # ------------------------------------------------------------- document ---
 
-async def upload_document(file_path: str | None):
-    if not file_path:
-        yield "Choose a PDF first.", _status_text()
+async def upload_documents(file_paths: list[str] | None, mode: str):
+    if not file_paths:
+        yield "Choose at least one PDF.", _status_text(), gr.update(choices=_document_choices())
         return
-    yield "Processing document\u2026", _status_text()
+    yield "Processing document(s)\u2026", _status_text(), gr.update()
     try:
         upload_dir = Path("data/uploads")
         upload_dir.mkdir(parents=True, exist_ok=True)
-        destination = upload_dir / Path(file_path).name
-        shutil.copy2(file_path, destination)
-        # load_document/_try_start rebuild the index (PDF parse + embed),
-        # which blocks — run it off the event loop so the UI doesn't freeze.
+        destinations = []
+        for file_path in file_paths:
+            destination = upload_dir / Path(file_path).name
+            shutil.copy2(file_path, destination)
+            destinations.append(str(destination))
+
+        messages = []
+        replace = mode == "Replace all"
         if backend is None:
-            message = await asyncio.to_thread(_try_start, str(destination))
+            messages.append(await asyncio.to_thread(_try_start, destinations[0]))
+            remaining = destinations[1:]
+        elif replace:
+            messages.append(await asyncio.to_thread(backend.load_document, destinations[0]))
+            remaining = destinations[1:]
         else:
-            message = await asyncio.to_thread(backend.load_document, str(destination))
-        yield message, _status_text(refresh=True)
+            remaining = destinations
+
+        for path in remaining:
+            messages.append(await asyncio.to_thread(backend.add_document, path))
+
+        yield " ".join(messages), _status_text(refresh=True), gr.update(choices=_document_choices(), value=None)
     except Exception as error:
-        yield f"Upload failed: {error}", _status_text()
+        yield f"Upload failed: {error}", _status_text(), gr.update(choices=_document_choices())
+
+
+async def remove_document(name: str | None):
+    if backend is None:
+        yield startup_error, _status_text(), gr.update(choices=_document_choices())
+        return
+    if not name:
+        yield "Pick a loaded document to remove first.", _status_text(), gr.update()
+        return
+    path = _path_for_name(name)
+    if not path:
+        yield f"{name} isn't loaded.", _status_text(), gr.update(choices=_document_choices())
+        return
+    yield f"Removing {name}\u2026", _status_text(), gr.update()
+    try:
+        message = await asyncio.to_thread(backend.remove_document, path)
+        yield message, _status_text(refresh=True), gr.update(choices=_document_choices(), value=None)
+    except Exception as error:
+        yield f"Couldn't remove {name}: {error}", _status_text(), gr.update(choices=_document_choices())
 
 
 async def rebuild_index():
@@ -197,12 +231,25 @@ async def switch_embeddings(choice: str):
     if backend is None:
         yield startup_error, _status_text()
         return
+    provider_key = choice.lower().replace(".", "").replace(" ", "")
     yield f"Switching to {choice.lower()} embeddings\u2026", _status_text()
     try:
-        message = await asyncio.to_thread(backend.set_embedding_provider, choice.lower())
+        message = await asyncio.to_thread(backend.set_embedding_provider, provider_key)
         yield message, _status_text(refresh=True)
     except Exception as error:
         yield f"Couldn't switch embeddings: {error}", _status_text()
+
+
+async def refresh_mcp_tools():
+    if backend is None:
+        yield startup_error, _status_text()
+        return
+    yield "Reloading MCP tools\u2026", _status_text()
+    try:
+        message = await asyncio.to_thread(backend.refresh_tools)
+        yield message, _status_text(refresh=True)
+    except Exception as error:
+        yield f"Couldn't reload MCP tools: {error}", _status_text()
 
 
 def clear_user(user_id: str):
@@ -236,7 +283,7 @@ def _launch():
 
 with gr.Blocks(title="DocuChat", theme=gr.themes.Base(primary_hue="blue", neutral_hue="slate")) as demo:
     with gr.Row():
-        gr.Markdown("## DocuChat\nAsk questions about a PDF using a local llama.cpp model, Gemini, or Ollama.")
+        gr.Markdown("## DocuChat\nAsk questions across one or more PDFs using llama.cpp, Gemini, or Ollama \u2014 with optional MCP tools.")
         theme_toggle = gr.Button("\U0001F319 / \u2600\ufe0f", size="sm", scale=0)
         theme_toggle.click(None, None, None, js=THEME_TOGGLE_JS)
 
@@ -249,23 +296,42 @@ with gr.Blocks(title="DocuChat", theme=gr.themes.Base(primary_hue="blue", neutra
             provider = gr.Radio(PROVIDERS, value="Llama.cpp", label="Model")
             embedding_choice = gr.Radio(
                 EMBEDDING_CHOICES,
-                value="Online" if (backend and backend.embedding_provider == "online") else "Local",
+                value=(
+                    {"online": "Online", "llamacpp": "Llama.cpp"}.get(
+                        backend.embedding_provider if backend else "local", "Local"
+                    )
+                ),
                 label="Embeddings",
-                info="Local = private, runs here. Online = Google API, needs GEMINI_API_KEY.",
+                info="Local = HuggingFace here. Online = Google API. Llama.cpp = your llama-server's own embeddings.",
             )
             system_status = gr.Markdown(_status_text())
-            refresh = gr.Button("Refresh status", size="sm")
+            with gr.Row():
+                refresh = gr.Button("Refresh status", size="sm")
+                refresh_mcp = gr.Button("Reload MCP tools", size="sm")
             refresh.click(_refresh_status, outputs=system_status)
             embedding_message = gr.Markdown()
             embedding_choice.change(switch_embeddings, inputs=embedding_choice, outputs=[embedding_message, system_status])
+            refresh_mcp.click(refresh_mcp_tools, outputs=[embedding_message, system_status])
 
             gr.Markdown("---")
-            pdf_upload = gr.File(label="Upload a PDF", file_types=[".pdf"], type="filepath")
-            process = gr.Button("Process document", variant="primary")
+            pdf_upload = gr.File(label="Upload PDF(s)", file_types=[".pdf"], file_count="multiple", type="filepath")
+            upload_mode = gr.Radio(["Add to existing", "Replace all"], value="Add to existing", label="On process")
+            process = gr.Button("Process document(s)", variant="primary")
             rebuild = gr.Button("Rebuild index", size="sm")
             document_message = gr.Markdown()
-            process.click(upload_document, inputs=pdf_upload, outputs=[document_message, system_status])
+
+            loaded_docs = gr.Dropdown(choices=_document_choices(), label="Loaded documents", interactive=True)
+            remove_doc_btn = gr.Button("Remove selected document", size="sm")
+
+            process.click(
+                upload_documents,
+                inputs=[pdf_upload, upload_mode],
+                outputs=[document_message, system_status, loaded_docs],
+            )
             rebuild.click(rebuild_index, outputs=document_message)
+            remove_doc_btn.click(
+                remove_document, inputs=loaded_docs, outputs=[document_message, system_status, loaded_docs]
+            )
 
             gr.Markdown("---")
             clear_memory = gr.Button("Clear my chat & memory", size="sm")
@@ -274,7 +340,7 @@ with gr.Blocks(title="DocuChat", theme=gr.themes.Base(primary_hue="blue", neutra
                 not_helpful = gr.Button("\U0001F44E", size="sm")
 
         with gr.Column(scale=2, min_width=560):
-            chatbot = gr.Chatbot(type="messages", height=460, show_label=False, placeholder="Ask a question about your document.")
+            chatbot = gr.Chatbot(type="messages", height=460, show_label=False, placeholder="Ask a question about your document(s).")
             question = gr.Textbox(label="Your question", placeholder="What are the main findings?", lines=2)
             with gr.Row():
                 ask = gr.Button("Ask", variant="primary", scale=3)

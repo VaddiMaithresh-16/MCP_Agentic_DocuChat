@@ -47,7 +47,7 @@ from prompt_engineering import (
 )
 
 LOCAL_PROVIDERS = {"ollama", "llamacpp"}
-EMBEDDING_PROVIDERS = {"local", "online"}
+EMBEDDING_PROVIDERS = {"local", "online", "llamacpp"}
 
 load_dotenv()
 
@@ -82,14 +82,22 @@ class RagBackend:
     """Manage document indexing, provider selection, memory, and response caching."""
 
     def __init__(self, document_path: str | None = None) -> None:
-        self.document_path = document_path or os.getenv("DOCUMENT_PATH", "./data/research_paper.pdf")
+        self.document_paths: list[str] = [document_path or os.getenv("DOCUMENT_PATH", "./data/research_paper.pdf")]
 
         # Embeddings: "local" runs a HuggingFace sentence-transformer on
         # this machine (private, no API calls); "online" calls Google's
-        # embedding API (needs GEMINI_API_KEY, no local model download).
+        # embedding API (needs GEMINI_API_KEY, no local model download);
+        # "llamacpp" calls a local llama-server's own /v1/embeddings
+        # endpoint — fully local, no HuggingFace download either.
         self.embedding_provider = os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
         self.embedding_model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-base-en-v1.5").strip()
         self.embedding_model_online = os.getenv("EMBEDDING_MODEL_ONLINE", "models/text-embedding-004").strip()
+        # A separate llama-server instance/port is typical for embeddings
+        # (a chat model and an embedding model are rarely the same GGUF),
+        # so this defaults to its own base URL rather than reusing
+        # LLAMACPP_BASE_URL, but falls back to it if unset.
+        self.llamacpp_embed_base_url = os.getenv("LLAMACPP_EMBED_BASE_URL", "").strip()
+        self.embedding_model_llamacpp = os.getenv("LLAMACPP_EMBED_MODEL", "").strip()
 
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
         self.ollama_model = os.getenv("OLLAMA_MODEL", "gemma3:4b").strip()
@@ -157,7 +165,7 @@ class RagBackend:
         """Fail fast and clearly at startup instead of mid-conversation."""
         if self.embedding_provider not in EMBEDDING_PROVIDERS:
             raise RuntimeError(
-                f"EMBEDDING_PROVIDER must be 'local' or 'online', got '{self.embedding_provider}'."
+                f"EMBEDDING_PROVIDER must be 'local', 'online', or 'llamacpp', got '{self.embedding_provider}'."
             )
         if self.embedding_provider == "online" and not self.gemini_api_key:
             raise RuntimeError(
@@ -168,11 +176,18 @@ class RagBackend:
         if self.retrieval_fetch_k < self.retrieval_k:
             raise RuntimeError("RETRIEVAL_FETCH_K must be >= RETRIEVAL_K.")
         logger.info(
-            "Config OK — embeddings=%s (%s), document=%s",
+            "Config OK — embeddings=%s (%s), documents=%s",
             self.embedding_provider,
-            self.embedding_model_online if self.embedding_provider == "online" else self.embedding_model_name,
-            self.document_path,
+            self._embedding_label(),
+            self.document_label,
         )
+
+    def _embedding_label(self) -> str:
+        if self.embedding_provider == "online":
+            return self.embedding_model_online
+        if self.embedding_provider == "llamacpp":
+            return f"{self._llamacpp_embed_model_name} @ {self._llamacpp_embed_url}"
+        return self.embedding_model_name
 
     def _check_rate_limit(self, user_id: str) -> None:
         now = time.monotonic()
@@ -182,46 +197,74 @@ class RagBackend:
             raise RuntimeError(f"You're asking a bit fast — wait {wait}s and try again.")
         self._last_request_time[user_id] = now
 
+    @property
+    def document_label(self) -> str:
+        """Human-readable summary of every loaded document, for status/logs."""
+        return ", ".join(Path(path).name for path in self.document_paths) or "(no document loaded)"
+
+    @property
+    def _llamacpp_embed_url(self) -> str:
+        """A separate llama-server instance/port is typical for embeddings.
+        Falls back to the chat server's URL if no dedicated one is set."""
+        return self.llamacpp_embed_base_url or self.llamacpp_base_url
+
+    @property
+    def _llamacpp_embed_model_name(self) -> str:
+        return self.embedding_model_llamacpp or self.llamacpp_model
+
     # ---------------------------------------------------------------- index
 
     def _document_version(self, force_nonce: str = "") -> str:
-        embedding_key = (
-            f"online:{self.embedding_model_online}"
-            if self.embedding_provider == "online"
-            else f"local:{self.embedding_model_name}"
-        )
-        path = Path(self.document_path)
-        if path.exists():
-            return f"{path.resolve()}:{path.stat().st_mtime_ns}:{path.stat().st_size}:{embedding_key}:{force_nonce}"
-        return f"{self.document_path}:{embedding_key}:{force_nonce}"
+        embedding_key = f"{self.embedding_provider}:{self._embedding_label()}"
+        parts = []
+        for path_str in self.document_paths:
+            path = Path(path_str)
+            if path.exists():
+                parts.append(f"{path.resolve()}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
+            else:
+                parts.append(path_str)
+        documents_key = "|".join(sorted(parts))
+        return f"{documents_key}:{embedding_key}:{force_nonce}"
 
     def _refresh_index(self, force_nonce: str = "") -> None:
         new_version = self._document_version(force_nonce)
         if new_version == self.document_version and getattr(self, "vector_store", None) is not None:
-            # Same document, same embedding config, no forced rebuild —
+            # Same document set, same embedding config, no forced rebuild —
             # nothing changed since the last build, skip re-reading and
-            # re-embedding the PDF entirely.
-            logger.debug("Index unchanged, skipping rebuild for %s", self.document_path)
+            # re-embedding the PDFs entirely.
+            logger.debug("Index unchanged, skipping rebuild for %s", self.document_label)
             return
         self.document_version = new_version
         base_collection = os.getenv("CHROMA_COLLECTION", "agentic_rag_research_collection")
         collection_suffix = hashlib.sha1(self.document_version.encode()).hexdigest()[:10]
         self.collection_name = f"{base_collection}_{collection_suffix}"
-        logger.info("Building index for %s (collection %s)", self.document_path, self.collection_name)
+        logger.info("Building index for %s (collection %s)", self.document_label, self.collection_name)
         self.documents, self.vector_store = self._build_index()
 
     def _load_documents(self):
-        try:
-            documents = PyPDFLoader(self.document_path).load()
-        except FileNotFoundError as error:
-            raise RuntimeError(f"DOCUMENT_PATH not found: {self.document_path}") from error
-        except requests.exceptions.RequestException as error:
-            raise RuntimeError(f"Could not fetch DOCUMENT_PATH: {error}") from error
-        except Exception as error:
-            raise RuntimeError(f"Could not load PDF: {error}") from error
-        if not documents:
-            raise RuntimeError("The PDF contains no pages.")
-        return documents
+        """Load every configured PDF. A single bad file doesn't sink the
+        whole set — it's skipped with a logged warning, and the request
+        only fails if nothing at all could be loaded."""
+        all_documents = []
+        problems = []
+        for path in self.document_paths:
+            try:
+                docs = PyPDFLoader(path).load()
+                if not docs:
+                    problems.append(f"{Path(path).name}: contains no pages")
+                    continue
+                all_documents.extend(docs)
+            except FileNotFoundError:
+                problems.append(f"{Path(path).name}: file not found")
+            except requests.exceptions.RequestException as error:
+                problems.append(f"{Path(path).name}: fetch failed ({error})")
+            except Exception as error:  # noqa: BLE001 - surfaced per-file below
+                problems.append(f"{Path(path).name}: {error}")
+        if not all_documents:
+            raise RuntimeError("Could not load any PDF. " + "; ".join(problems) if problems else "No document configured.")
+        if problems:
+            logger.warning("Some documents failed to load and were skipped: %s", "; ".join(problems))
+        return all_documents
 
     def _get_embeddings(self):
         """Embedding model objects are expensive to build (model load into
@@ -244,6 +287,29 @@ class RagBackend:
                 )
             return self._embedding_models[key]
 
+        if self.embedding_provider == "llamacpp":
+            key = f"llamacpp:{self._llamacpp_embed_url}:{self._llamacpp_embed_model_name}"
+            if key not in self._embedding_models:
+                try:
+                    from langchain_openai import OpenAIEmbeddings
+                except ImportError as error:
+                    raise RuntimeError(
+                        "Install langchain-openai to use EMBEDDING_PROVIDER=llamacpp."
+                    ) from error
+                logger.info(
+                    "Loading llama.cpp embeddings %s @ %s", self._llamacpp_embed_model_name, self._llamacpp_embed_url
+                )
+                self._embedding_models[key] = OpenAIEmbeddings(
+                    model=self._llamacpp_embed_model_name,
+                    base_url=self._llamacpp_embed_url,
+                    api_key=self.llamacpp_api_key,
+                    # llama-server's /v1/embeddings doesn't support the
+                    # tiktoken-based pre-tokenization the OpenAI client
+                    # tries by default for non-OpenAI model names.
+                    check_embedding_ctx_length=False,
+                )
+            return self._embedding_models[key]
+
         key = f"local:{self.embedding_model_name}"
         if key not in self._embedding_models:
             embedding_kwargs: dict[str, Any] = {"model_name": self.embedding_model_name}
@@ -262,7 +328,11 @@ class RagBackend:
         )
         chunks = splitter.split_documents(documents)
         for chunk in chunks:
-            chunk.metadata["source_file"] = Path(self.document_path).name
+            # Each chunk keeps the 'source' path PyPDFLoader stamped on its
+            # parent document, so this is correct per-file even with
+            # multiple PDFs loaded at once — not hardcoded to one document.
+            source_path = chunk.metadata.get("source") or (self.document_paths[0] if self.document_paths else "")
+            chunk.metadata["source_file"] = Path(source_path).name
             chunk.metadata["page_number"] = int(chunk.metadata.get("page", 0)) + 1
         embeddings = self._get_embeddings()
         store = Chroma(
@@ -485,21 +555,74 @@ class RagBackend:
             )
         return str(content)
 
+    async def _agent_stream_text(self, agent, context_package: str, user_id: str):
+        """Yield the agent's final-answer text incrementally by watching
+        for chat-model token events. LangGraph agents also emit tool-call
+        and tool-result events along the way (retrieval, MCP calls) — those
+        are intentionally not yielded here, only the model's own text
+        tokens, so the UI only ever shows answer text, not tool chatter."""
+        async for event in agent.astream_events(
+            {"messages": [{"role": "user", "content": context_package}]},
+            version="v2",
+            config={"configurable": {"thread_id": user_id}},
+        ):
+            if event.get("event") == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                piece = getattr(chunk, "content", None) if chunk is not None else None
+                if isinstance(piece, str) and piece:
+                    yield piece
+
     # ----------------------------------------------------------------- ask
 
     async def ask(self, question: str, user_id: str = "default", provider: str = "gemini") -> dict[str, Any]:
+        """Non-streaming convenience wrapper — consumes `astream_answer`
+        and returns only the final answer, so there's one implementation
+        of the retrieval → generate → cache → memory pipeline, not two."""
         question = question.strip()
         user_id = user_id.strip() or "default"
         if not question:
             return {"answer": "Please enter a question.", "cached": False, "sources": []}
         self._check_rate_limit(user_id)
-        return await self._ask_impl(question, user_id, provider)
+        answer, sources, cached = "", [], False
+        async for answer, sources, cached in self._astream_answer_impl(question, user_id, provider):
+            pass
+        return {
+            "answer": answer,
+            "cached": cached,
+            "sources": sources,
+            "provider": provider.lower(),
+            "model": self._model_name_for(provider),
+        }
 
-    async def _ask_impl(self, question: str, user_id: str, provider: str) -> dict[str, Any]:
-        """Shared answer logic, without the rate-limit check — `ask()`
-        checks it once; `astream_answer()`'s non-streaming fallback (Gemini)
-        already checked it too, so this avoids double-charging one request
-        against the per-user cooldown."""
+    def _model_name_for(self, provider: str) -> str:
+        provider = provider.lower()
+        if provider == "gemini":
+            return self.gemini_model
+        _, model_name = self._get_model(provider)
+        return model_name
+
+    # ------------------------------------------------------------ streaming
+
+    async def astream_answer(self, question: str, user_id: str = "default", provider: str = "llamacpp"):
+        """Yield (answer_so_far, sources) incrementally. Direct-grounded
+        local providers stream real tokens. Agent-based providers (Gemini
+        always; local providers when MCP tools are configured) stream the
+        agent's own text tokens when the underlying model supports it, and
+        transparently fall back to one non-streaming chunk if it doesn't
+        (some tool-calling turns emit no direct chat-model stream event)."""
+        question = question.strip()
+        user_id = user_id.strip() or "default"
+        if not question:
+            yield "Please enter a question.", []
+            return
+        self._check_rate_limit(user_id)
+        async for answer, sources, _cached in self._astream_answer_impl(question, user_id, provider):
+            yield answer, sources
+
+    async def _astream_answer_impl(self, question: str, user_id: str, provider: str):
+        """Shared streaming pipeline, without the rate-limit check (both
+        `ask()` and `astream_answer()` check it once at their own entry).
+        Yields (answer_so_far, sources, is_from_cache) triples."""
         provider = provider.lower()
         if provider not in {"gemini", "ollama", "llamacpp"}:
             raise RuntimeError("Choose Gemini, Ollama, or llama.cpp.")
@@ -508,10 +631,7 @@ class RagBackend:
         # llama.cpp auto-detects the server's actual loaded model) so the
         # cache key and the model name shown in the UI both use the real
         # model, not a possibly-stale config value.
-        if provider == "gemini":
-            model_name = self.gemini_model
-        else:
-            _, model_name = self._get_model(provider)
+        model_name = self._model_name_for(provider)
 
         # Cache key uses durable memory only. Recent conversation changes
         # every turn, so keying on it (as before) meant a verbatim repeated
@@ -523,25 +643,35 @@ class RagBackend:
         cached = self.cache.get(key)
         if cached:
             self.memory.auto_capture(user_id, question)
-            cached["cached"] = True
-            return cached
+            yield cached["answer"], cached.get("sources", []), True
+            return
 
         # One retrieval pass, reused for generation context and displayed
-        # sources on both providers (previously Ollama ran it twice, and
-        # Gemini's agent got no pre-fetched context at all).
+        # sources across every provider (not re-queried per provider).
         context_text, sources, _docs = self._retrieve(question)
         recent_text = self.memory.recent_turns_text(user_id)
         context_package = build_context_package(question, memories_text, recent_text, context_text)
-
         max_attempts = max(1, int(os.getenv("ANSWER_LOOP_MAX_ATTEMPTS", "2")))
 
         if self._use_agent(provider):
             agent = self._get_agent(provider)
-            response = await agent.ainvoke(
-                {"messages": [{"role": "user", "content": context_package}]},
-                config={"configurable": {"thread_id": user_id}},
-            )
-            answer = self._answer_text(response)
+            answer = ""
+            try:
+                async for piece in self._agent_stream_text(agent, context_package, user_id):
+                    answer += piece
+                    yield answer, sources, False
+            except Exception as error:  # noqa: BLE001 - fall back below
+                logger.debug("Agent token streaming unavailable (%s), using ainvoke instead.", error)
+            if not answer:
+                # Nothing streamed — either the backend doesn't support
+                # astream_events, or the whole turn was tool calls with no
+                # direct text chunk. Fall back to a single full response.
+                response = await agent.ainvoke(
+                    {"messages": [{"role": "user", "content": context_package}]},
+                    config={"configurable": {"thread_id": user_id}},
+                )
+                answer = self._answer_text(response)
+                yield answer, sources, False
             # Loop engineering for agent-based providers too: a single
             # grounding check + repair pass, using the raw model directly
             # rather than re-running the whole tool-calling agent.
@@ -549,89 +679,18 @@ class RagBackend:
                 model, _ = self._get_model(provider)
                 repair_response = await _invoke_with_retry(model, repair_prompt(context_package, answer))
                 answer = self._answer_text({"messages": [repair_response]})
+                yield answer, sources, False
         else:
             model, _ = self._get_model(provider)
             answer = ""
-            for attempt in range(1, max_attempts + 1):
-                response = await _invoke_with_retry(model, ollama_prompt(context_package, attempt))
-                answer = self._answer_text({"messages": [response]})
-                if not needs_grounding_repair(answer, context_text) or attempt == max_attempts:
-                    break
+            async for chunk in model.astream(ollama_prompt(context_package, 1)):
+                piece = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+                answer += piece
+                yield answer, sources, False
+            if needs_grounding_repair(answer, context_text):
                 response = await _invoke_with_retry(model, repair_prompt(context_package, answer))
                 answer = self._answer_text({"messages": [response]})
-
-        result = {
-            "answer": answer,
-            "cached": False,
-            "sources": sources,
-            "provider": provider,
-            "model": model_name,
-        }
-        self.memory.auto_capture(user_id, question)
-        self.memory.add_turn(user_id, question, answer)
-        self.cache.put(key, result)
-        return result
-
-    # ------------------------------------------------------------ streaming
-
-    async def astream_answer(self, question: str, user_id: str = "default", provider: str = "llamacpp"):
-        """Yield answer text incrementally for local providers (llama.cpp,
-        Ollama) when no MCP tools are needed, so the UI can show tokens as
-        they're generated instead of waiting for the full response. Falls
-        back to a single chunk when the tool-calling agent is in play
-        (Gemini always; local providers when MCP tools are configured),
-        since agents don't stream cleanly through this path.
-
-        Cache and memory bookkeeping mirror `ask()` — this is a streaming
-        twin of it, not a separate code path for retrieval or storage.
-        """
-        question = question.strip()
-        user_id = user_id.strip() or "default"
-        provider = provider.lower()
-        if not question:
-            yield "Please enter a question.", []
-            return
-        self._check_rate_limit(user_id)
-        if provider not in {"gemini", "ollama", "llamacpp"}:
-            raise RuntimeError("Choose Gemini, Ollama, or llama.cpp.")
-
-        if self._use_agent(provider):
-            # Non-streaming fallback — reuse the normal ask() path. Checked
-            # before retrieval runs here, so it isn't run twice.
-            result = await self._ask_impl(question, user_id, provider)
-            yield result["answer"], result["sources"]
-            return
-
-        if provider == "gemini":
-            model_name = self.gemini_model
-        else:
-            _, model_name = self._get_model(provider)
-
-        memories_text = self.memory.memories_text(user_id)
-        key = self.memory.cache_key(
-            user_id, question, self.document_version, f"{provider}:{model_name}", memories_text
-        )
-        cached = self.cache.get(key)
-        if cached:
-            self.memory.auto_capture(user_id, question)
-            yield cached["answer"], cached.get("sources", [])
-            return
-
-        context_text, sources, _docs = self._retrieve(question)
-        recent_text = self.memory.recent_turns_text(user_id)
-        context_package = build_context_package(question, memories_text, recent_text, context_text)
-
-        model, _ = self._get_model(provider)
-        answer = ""
-        async for chunk in model.astream(ollama_prompt(context_package, 1)):
-            piece = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
-            answer += piece
-            yield answer, sources
-
-        if needs_grounding_repair(answer, context_text):
-            response = await _invoke_with_retry(model, repair_prompt(context_package, answer))
-            answer = self._answer_text({"messages": [response]})
-            yield answer, sources
+                yield answer, sources, False
 
         result = {
             "answer": answer,
@@ -647,27 +706,58 @@ class RagBackend:
     # ------------------------------------------------------------- controls
 
     def load_document(self, document_path: str) -> str:
-        self.document_path = document_path
-        self._agents.clear()  # tools/checkpointer tied to the prior document
+        """Replace the whole loaded document set with just this one PDF."""
+        self.document_paths = [document_path]
+        self._agents.clear()  # tools/checkpointer tied to the prior document set
         self._refresh_index()
         self.cache.clear()
         return f"Loaded {Path(document_path).name} ({len(self.documents)} pages)."
+
+    def add_document(self, document_path: str) -> str:
+        """Add another PDF alongside whatever's already loaded, instead of
+        replacing it — multiple documents are searched together."""
+        if document_path in self.document_paths:
+            return f"{Path(document_path).name} is already loaded."
+        self.document_paths.append(document_path)
+        self._agents.clear()
+        self._refresh_index()
+        self.cache.clear()
+        names = ", ".join(Path(p).name for p in self.document_paths)
+        return f"Added {Path(document_path).name}. Now searching {len(self.document_paths)} document(s): {names}."
+
+    def remove_document(self, document_path: str) -> str:
+        """Drop one PDF from the loaded set. Requires a rebuild — a new
+        Chroma collection is created for the smaller document set (its
+        version fingerprint changes), so this re-embeds the remaining
+        documents once rather than trying to selectively delete vectors."""
+        if document_path not in self.document_paths:
+            return f"{Path(document_path).name} isn't currently loaded."
+        if len(self.document_paths) == 1:
+            return "That's the only loaded document — load a replacement instead of removing it."
+        self.document_paths.remove(document_path)
+        self._agents.clear()
+        self._refresh_index(force_nonce=str(time.time_ns()))
+        self.cache.clear()
+        return f"Removed {Path(document_path).name}. Now searching {len(self.document_paths)} document(s)."
+
+    def list_documents(self) -> list[str]:
+        return list(self.document_paths)
 
     def rebuild_index(self) -> str:
         self._agents.clear()
         self._refresh_index(force_nonce=str(time.time_ns()))
         self.cache.clear()
-        return f"Rebuilt the index for {Path(self.document_path).name}."
+        return f"Rebuilt the index for {self.document_label}."
 
     def set_embedding_provider(self, provider: str) -> str:
-        """Switch between local (HuggingFace) and online (Google) embeddings
-        at runtime and rebuild the index under the new vector space —
-        vectors from different embedding models aren't comparable, so a
-        plain provider swap without a rebuild would silently return
-        garbage retrieval results."""
+        """Switch between local (HuggingFace), online (Google), and
+        llamacpp (llama-server /v1/embeddings) at runtime and rebuild the
+        index under the new vector space — vectors from different
+        embedding models aren't comparable, so a plain provider swap
+        without a rebuild would silently return garbage retrieval results."""
         provider = provider.strip().lower()
         if provider not in EMBEDDING_PROVIDERS:
-            raise RuntimeError("Embedding provider must be 'local' or 'online'.")
+            raise RuntimeError("Embedding provider must be 'local', 'online', or 'llamacpp'.")
         if provider == "online" and not self.gemini_api_key:
             raise RuntimeError("Online embeddings need GEMINI_API_KEY set.")
         if provider == self.embedding_provider:
@@ -676,8 +766,17 @@ class RagBackend:
         self._agents.clear()
         self._refresh_index(force_nonce=str(time.time_ns()))
         self.cache.clear()
-        label = self.embedding_model_online if provider == "online" else self.embedding_model_name
-        return f"Switched to {provider} embeddings ({label}) and rebuilt the index."
+        return f"Switched to {provider} embeddings ({self._embedding_label()}) and rebuilt the index."
+
+    def refresh_tools(self) -> str:
+        """Re-fetch Composio (MCP) tools without a full restart — picks up
+        a toolkit you just connected/added on your Composio account."""
+        self._tools_cache = None
+        self._agents.clear()  # agents built with the old tool list must be rebuilt
+        tools = self._get_tools()
+        if tools:
+            return f"Reloaded MCP tools: {len(tools)} tool(s) from {', '.join(self.composio_toolkits)}."
+        return "No MCP tools configured (check COMPOSIO_API_KEY/COMPOSIO_USER_ID/COMPOSIO_TOOLKITS)."
 
     def remember(self, memory: str, user_id: str = "default") -> str:
         memory = memory.strip()
@@ -697,17 +796,14 @@ class RagBackend:
         return "Thanks for the feedback."
 
     def status(self, refresh: bool = True) -> dict[str, Any]:
-        embedding_label = (
-            f"{self.embedding_model_online} (online)"
-            if self.embedding_provider == "online"
-            else f"{self.embedding_model_name} (local)"
-        )
+        embedding_label = f"{self._embedding_label()} ({self.embedding_provider})"
         tools = self._get_tools()
         mcp_label = (
             f"{len(tools)} tool(s) from {', '.join(self.composio_toolkits)}" if tools else "off"
         )
         return {
-            "document": Path(self.document_path).name,
+            "document": self.document_label,
+            "document_count": len(self.document_paths),
             "pages": len(self.documents),
             "embedding_model": embedding_label,
             "mcp_tools": mcp_label,
